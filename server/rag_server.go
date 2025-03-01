@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"rag-server/utils"
+	"sort"
 	"strings"
 
 	"github.com/tmc/langchaingo/llms"
@@ -24,18 +24,8 @@ type RagServer struct {
 	ModelName    string
 }
 
-type document struct {
-	Text        string
-	FileName    string `json:"file_name"`
-	ContentType string `json:"content_type"` // "text/markdown" or "text/plain"
-}
-
-type addRequest struct {
-	Files []*multipart.FileHeader `form:"files"`
-}
-
 type queryRequest struct {
-	Content string
+	Content string `json:"content"`
 }
 
 const ragTemplateStr = `
@@ -62,7 +52,7 @@ Context:
 func (rs *RagServer) AddDocumentHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Received document upload request")
 
-	if err := r.ParseMultipartForm(32 << 20); err != nil { // 32MB max memory
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		log.Printf("Error parsing multipart form: %v", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -75,7 +65,13 @@ func (rs *RagServer) AddDocumentHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	const (
+		sentencesPerChunk = 15
+		overlapSentences  = 3
+	)
+
 	var docs []schema.Document
+	totalChunks := 0
 
 	for _, fileHeader := range files {
 		file, err := fileHeader.Open()
@@ -98,18 +94,27 @@ func (rs *RagServer) AddDocumentHandler(w http.ResponseWriter, r *http.Request) 
 			contentType = "text/markdown"
 		}
 
-		doc := schema.Document{
-			PageContent: string(content),
-			Metadata: map[string]any{
-				"file_name":    fileHeader.Filename,
-				"content_type": contentType,
-			},
+		baseMetadata := map[string]any{
+			"file_name":    fileHeader.Filename,
+			"content_type": contentType,
 		}
-		docs = append(docs, doc)
-		log.Printf("Processed file: %s (%s)", fileHeader.Filename, contentType)
+
+		// Switch to sentence-based chunking
+		chunks := utils.ChunkDocumentWithMetadata(string(content), baseMetadata, sentencesPerChunk, overlapSentences)
+
+		for _, chunk := range chunks {
+			doc := schema.Document{
+				PageContent: chunk.Content,
+				Metadata:    chunk.Metadata,
+			}
+			docs = append(docs, doc)
+		}
+
+		log.Printf("Processed file: %s (%s) - split into %d chunks", fileHeader.Filename, contentType, len(chunks))
+		totalChunks += len(chunks)
 	}
 
-	log.Printf("Attempting to add %d documents to Weaviate", len(docs))
+	log.Printf("Attempting to add %d document chunks to Weaviate", len(docs))
 	_, err := rs.WvClient.AddDocuments(rs.Ctx, docs)
 	if err != nil {
 		log.Printf("Error adding documents to Weaviate: %v", err)
@@ -117,15 +122,18 @@ func (rs *RagServer) AddDocumentHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	log.Printf("Successfully added %d documents to Weaviate", len(docs))
-	utils.RenderJSON(w, map[string]string{
-		"message": fmt.Sprintf("Successfully uploaded %d files", len(docs)),
+	log.Printf("Successfully added %d document chunks to Weaviate", len(docs))
+	utils.RenderJSON(w, map[string]interface{}{
+		"message":     fmt.Sprintf("Successfully uploaded %d files (split into %d chunks)", len(files), totalChunks),
+		"file_count":  len(files),
+		"chunk_count": totalChunks,
 	})
 }
 
 func (rs *RagServer) QueryHandler(w http.ResponseWriter, r *http.Request) {
 	qr := &queryRequest{}
 	err := utils.ReadRequestJSON(r, qr)
+	log.Printf("Reading request JSON %v", qr)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -165,57 +173,140 @@ type StreamResponse struct {
 }
 
 func (rs *RagServer) EnhancedQueryHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("EnhancedQueryHandler: Received %s request from %s", r.Method, r.RemoteAddr)
+	log.Printf("EnhancedQueryHandler: URL path: %s", r.URL.Path)
+	log.Printf("EnhancedQueryHandler: Headers: %v", r.Header)
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("X-Accel-Buffering", "no")
+
 	if r.Method != http.MethodPost {
+		log.Printf("EnhancedQueryHandler: Invalid method: %s", r.Method)
 		http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var request struct {
-		Query string `json:"query"`
+		Content string `json:"content"`
+		Query   string `json:"query"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		log.Printf("EnhancedQueryHandler: Error decoding request body: %v", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Set headers for SSE
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// Try both content and query fields
+	queryText := request.Content
+	if queryText == "" {
+		queryText = request.Query
+	}
+
+	log.Printf("EnhancedQueryHandler: Received query: %s", queryText)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		log.Println("EnhancedQueryHandler: Streaming not supported")
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 		return
 	}
 
-	docs, err := rs.WvClient.SimilaritySearch(rs.Ctx, request.Query, 3)
+	log.Println("EnhancedQueryHandler: Performing similarity search")
+	// Increase the number of results to get more chunks
+	docs, err := rs.WvClient.SimilaritySearch(rs.Ctx, queryText, 5) // Increased from 3
 	if err != nil {
+		log.Printf("EnhancedQueryHandler: Similarity search error: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	log.Printf("EnhancedQueryHandler: Found %d document chunks", len(docs))
 
+	// Group chunks by filename for better presentation
+	fileChunks := make(map[string][]schema.Document)
 	for _, doc := range docs {
+		filename := "Unknown source"
+		if name, ok := doc.Metadata["file_name"].(string); ok && name != "" {
+			filename = name
+		}
+		fileChunks[filename] = append(fileChunks[filename], doc)
+	}
+
+	// Send context information by file
+	for filename, chunks := range fileChunks {
+		// Sort chunks by index if they're from the same document
+		// This uses the chunk_index metadata we added during chunking
+		sort.SliceStable(chunks, func(i, j int) bool {
+			iIdx, iOk := chunks[i].Metadata["chunk_index"].(int)
+			jIdx, jOk := chunks[j].Metadata["chunk_index"].(int)
+
+			if iOk && jOk {
+				return iIdx < jIdx
+			}
+			return false
+		})
+
+		log.Printf("EnhancedQueryHandler: Sending %d chunks from %s", len(chunks), filename)
+
+		// Combine chunks for this file into one context message
+		var combinedContent strings.Builder
+		combinedContent.WriteString(fmt.Sprintf("From %s:\n", filename))
+
+		for _, chunk := range chunks {
+			// If it's a multi-chunk document, add chunk info
+			if chunkInfo, ok := chunk.Metadata["chunk_info"].(string); ok && chunkInfo != "" {
+				combinedContent.WriteString(fmt.Sprintf("\n--- %s ---\n", chunkInfo))
+			}
+			combinedContent.WriteString(chunk.PageContent)
+			combinedContent.WriteString("\n")
+		}
+
+		// Format and send the combined context
 		contextResp := StreamResponse{
 			Type:    "context",
-			Content: fmt.Sprintf("From %s: %s", doc.Metadata["file_name"], doc.PageContent),
+			Content: combinedContent.String(),
 		}
-		if err := json.NewEncoder(w).Encode(contextResp); err != nil {
+
+		jsonData, err := json.Marshal(contextResp)
+		if err != nil {
+			log.Printf("EnhancedQueryHandler: Error marshaling context: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		fmt.Fprintf(w, "\n")
+
+		log.Printf("EnhancedQueryHandler: Writing combined context as SSE")
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", jsonData); err != nil {
+			log.Printf("EnhancedQueryHandler: Error writing context: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
 		flusher.Flush()
+		log.Println("EnhancedQueryHandler: Combined context flushed to client")
 	}
 
+	// Prepare LLM query using the same chunks
 	var docsContents []string
 	for _, doc := range docs {
-		sourceInfo := fmt.Sprintf("From %s:\n", doc.Metadata["file_name"])
+		filename := "Unknown source"
+		if name, ok := doc.Metadata["file_name"].(string); ok && name != "" {
+			filename = name
+		}
+
+		chunkInfo := ""
+		if info, ok := doc.Metadata["chunk_info"].(string); ok {
+			chunkInfo = info
+		}
+
+		sourceInfo := fmt.Sprintf("From %s%s:\n", filename, chunkInfo)
 		docsContents = append(docsContents, sourceInfo+doc.PageContent)
 	}
-	ragQuery := fmt.Sprintf(ragTemplateStr, request.Query, strings.Join(docsContents, "\n"))
+
+	ragQuery := fmt.Sprintf(ragTemplateStr, queryText, strings.Join(docsContents, "\n"))
+	log.Println("EnhancedQueryHandler: Sending query to LLM")
 
 	response, err := llms.GenerateFromSinglePrompt(
 		rs.Ctx,
@@ -224,18 +315,32 @@ func (rs *RagServer) EnhancedQueryHandler(w http.ResponseWriter, r *http.Request
 		llms.WithModel(rs.ModelName),
 	)
 	if err != nil {
+		log.Printf("EnhancedQueryHandler: LLM error: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	log.Println("EnhancedQueryHandler: LLM response received")
 
 	answerResp := StreamResponse{
 		Type:    "answer",
 		Content: response,
 	}
-	if err := json.NewEncoder(w).Encode(answerResp); err != nil {
+
+	jsonData, err := json.Marshal(answerResp)
+	if err != nil {
+		log.Printf("EnhancedQueryHandler: Error marshaling answer: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fmt.Fprintf(w, "\n")
+
+	// Format as proper SSE data with "data:" prefix and double newline
+	log.Printf("EnhancedQueryHandler: Writing answer as SSE")
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", jsonData); err != nil {
+		log.Printf("EnhancedQueryHandler: Error writing answer: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	flusher.Flush()
+	log.Println("EnhancedQueryHandler: Answer flushed to client")
 }

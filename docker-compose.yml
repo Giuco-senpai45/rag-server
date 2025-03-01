@@ -1,5 +1,6 @@
 services:
   weaviate:
+    container_name: weaviate-db
     command:
     - --host
     - 0.0.0.0
@@ -12,7 +13,6 @@ services:
     - 9035:9035
     - 50051:50051
     restart: on-failure:0
-    container_name: weaviate-db
     volumes:
       - weaviate_data:/var/lib/weaviate
     environment:
@@ -33,6 +33,18 @@ services:
       - 8080:8080
     env_file:
       - ./.env
+
+  frontend:
+    container_name: rag-frontend
+    build:
+      context: ./
+      dockerfile: ./frontend/Dockerfile
+    ports:
+      - 80:80
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - rag-server
 
 volumes:
   weaviate_data:

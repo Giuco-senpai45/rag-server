@@ -4,12 +4,17 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RAG System Demo</title>
+    <link rel="icon" type="image/png" href="../presentation/gemini.png">
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
     <script src="https://unpkg.com/@tailwindcss/browser@4"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.7.0/highlight.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.7.0/styles/github.min.css">
     <script src="js/app.js"></script>
+    <link rel="stylesheet" href="styles.css">
 </head>
 <body class="bg-cyan-700 h-screen">
-    <div x-data="ragApp()" class="max-w-4xl mx-auto">
+    <div x-data="ragApp()" x-init="init()" class="max-w-4xl mx-auto">
         <h1 class="text-3xl font-bold mb-8 text-black">RAG System Demo</h1>
 
         <div class="bg-white p-6 rounded-lg shadow-md mb-8">
@@ -18,10 +23,10 @@
                 <div class="mb-4">
                     <input type="file" 
                            multiple 
-                           name="files"
+                           name="documents"
                            @change="files = $event.target.files"
                            class="border p-2 w-full rounded"
-                           accept=".txt,.md,.pdf">
+                           accept=".txt,.md">
                     <div x-show="files.length > 0" class="mt-2">
                         <p class="text-sm text-gray-600">Selected files:</p>
                         <ul class="list-disc pl-5">
@@ -54,25 +59,63 @@
                 </div>
             </form>
         </div>
-
-        <div class="bg-white p-6 rounded-lg shadow-md">
-            <h2 class="text-xl font-semibold mb-4">Query Documents</h2>
-            <form @submit.prevent="queryDocuments">
-                <div class="mb-4">
-                    <x-model="query"
-                             class="border p-2 w-full rounded h-24"
-                             placeholder="Enter your query here..."></ textarea>
+    
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div class="bg-white p-6 rounded-lg shadow-md">
+                <h2 class="text-xl font-semibold mb-4">Standard Query</h2>
+                <form @submit.prevent="queryDocuments">
+                    <div class="mb-4">
+                        <textarea x-model="query"
+                                class="border p-2 w-full rounded h-24"
+                                placeholder="Enter your query here..."></textarea>
+                    </div>
+                    <button type="submit" 
+                            :disabled="querying || !query"
+                            class="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 disabled:bg-gray-400">
+                        <span x-text="querying ? 'Querying...' : 'Query'"></span> 
+                    </button>
+                </form>
+    
+                <div x-show="response" class="mt-6">
+                    <h3 class="font-semibold mb-2">Response:</h3>
+                    <div class="bg-gray-50 p-4 rounded prose prose-sm max-w-none" x-html="formatMarkdown(response)"></div>
                 </div>
-                <button type="submit" 
-                        :disabled="querying || !query"
-                        class="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 disabled:bg-gray-400">
-                    <span x-text="querying ? 'Querying...' : 'Query'"></span> 
-                </button>
-            </form>
-
-            <div x-show="response" class="mt-6">
-                <h3 class="font-semibold mb-2">Response:</h3>
-                <div class="bg-gray-50 p-4 rounded whitespace-pre-wrap" x-text="response"></div>
+            </div>
+    
+            <div class="bg-white p-6 rounded-lg shadow-md">
+                <h2 class="text-xl font-semibold mb-4">Enhanced Query (Streaming)</h2>
+                <form @submit.prevent="enhancedQueryDocuments">
+                    <div class="mb-4">
+                        <textarea x-model="enhancedQuery"
+                                class="border p-2 w-full rounded h-24"
+                                placeholder="Enter your query for streaming response..."></textarea>
+                    </div>
+                    <button type="submit" 
+                            :disabled="enhancedQuerying || !enhancedQuery"
+                            class="bg-purple-500 text-white px-4 py-2 rounded hover:bg-purple-600 disabled:bg-gray-400">
+                        <span x-text="enhancedQuerying ? 'Querying...' : 'Enhanced Query'"></span> 
+                    </button>
+                </form>
+    
+                <div x-show="contexts.length > 0 || enhancedResponse" class="mt-6">
+                    <template x-if="contexts.length > 0">
+                        <div class="mb-4">
+                            <h3 class="font-semibold mb-2">Retrieved Context:</h3>
+                            <div class="space-y-2">
+                                <template x-for="(context, index) in contexts" :key="index">
+                                    <div class="bg-blue-50 p-3 rounded text-sm prose prose-sm max-w-none" x-html="formatMarkdown(context)"></div>
+                                </template>
+                            </div>
+                        </div>
+                    </template>
+        
+                    <template x-if="enhancedResponse">
+                        <div>
+                            <h3 class="font-semibold mb-2">Answer:</h3>
+                            <div class="bg-purple-50 p-4 rounded prose prose-sm max-w-none" x-html="enhancedResponse"></div>
+                        </div>
+                    </template>
+                </div>
             </div>
         </div>
     </div>
