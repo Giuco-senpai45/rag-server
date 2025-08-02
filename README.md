@@ -7,8 +7,7 @@ class:
 ---
 
 # RAG Server Project
-A Retrieval Augmented Generation System
-![bg right:30% 70%](./presentation/repo.png)
+A Retrieval Augmented Generation System (presentation for the Gooogle Developer Groups Devfest 2025)
 
 ---
 # Technologies
